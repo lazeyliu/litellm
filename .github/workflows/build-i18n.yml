@@ -1,0 +1,107 @@
+name: Build LiteLLM i18n Image
+
+on:
+  # 每天凌晨 2 点自动检查上游更新并构建
+  schedule:
+    - cron: '0 2 * * *'
+  
+  # 手动触发，支持选择版本和语言
+  workflow_dispatch:
+    inputs:
+      litellm_version:
+        description: 'LiteLLM 基础镜像版本'
+        required: true
+        default: 'v1.99.1'
+      ui_lang:
+        description: 'UI 语言'
+        required: true
+        default: 'zh-CN'
+        type: choice
+        options:
+          - en
+          - ja
+          - ko
+          - zh-CN
+          - zh-TW
+      upstream_ref:
+        description: '上游 litellm-zhtw 分支/标签'
+        required: true
+        default: 'main'
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    
+    # 最小权限：只读代码 + 写包
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout my repository
+        uses: actions/checkout@v4
+
+      - name: Fetch upstream i18n source
+        id: upstream
+        run: |
+          set -e
+          UPSTREAM_DIR=$(mktemp -d)
+          
+          # 实时拉取上游最新代码
+          git clone --depth 1 \
+            --branch ${{ github.event.inputs.upstream_ref || 'main' }} \
+            https://github.com/Sen-CaPoo/litellm-zhtw.git "$UPSTREAM_DIR"
+          
+          # 记录上游 commit，用于镜像追溯
+          COMMIT_SHORT=$(cd "$UPSTREAM_DIR" && git rev-parse --short HEAD)
+          echo "commit=$COMMIT_SHORT" >> $GITHUB_OUTPUT
+          echo "Upstream commit: $COMMIT_SHORT"
+          
+          # 复制到构建上下文
+          cp -r "$UPSTREAM_DIR/zhtw" ./zhtw
+          
+          # 清理临时目录
+          rm -rf "$UPSTREAM_DIR"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            # 语言-版本，例如 zh-CN-v1.99.1
+            type=raw,value=${{ github.event.inputs.ui_lang || 'zh-CN' }}-${{ github.event.inputs.litellm_version || 'v1.99.1' }}
+            # 语言-latest，例如 zh-CN-latest
+            type=raw,value=${{ github.event.inputs.ui_lang || 'zh-CN' }}-latest
+            # 带上游 commit，方便追溯
+            type=raw,value=${{ github.event.inputs.ui_lang || 'zh-CN' }}-${{ github.event.inputs.litellm_version || 'v1.99.1' }}-upstream-${{ steps.upstream.outputs.commit }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            LITELLM_UI_LANG=${{ github.event.inputs.ui_lang || 'zh-CN' }}
+            LITELLM_VERSION=${{ github.event.inputs.litellm_version || 'v1.99.1' }}
+          # GitHub Actions 缓存，加速重复构建
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # 多平台支持（可选，如不需要可删除）
+          platforms: linux/amd64,linux/arm64
