@@ -1,13 +1,10 @@
-name: Build LiteLLM i18n Image
+name: 构建 LiteLLM 国际化镜像
 
 on:
-  schedule:
-    - cron: '0 2 * * *'
-  
   workflow_dispatch:
     inputs:
       litellm_version:
-        description: 'LiteLLM 基础镜像版本 (如 v1.99.1)'
+        description: 'LiteLLM 官方版本 Tag (如 v1.99.1)'
         required: true
         default: 'v1.99.1'
       ui_lang:
@@ -28,110 +25,88 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+  IMAGE_NAME: litellm-i18n
 
 jobs:
-  # 先列出上游可用 release，方便用户查看
-  list-releases:
+  构建并推送:
+    name: 构建镜像并推送到 GHCR
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - name: Fetch upstream releases
-        run: |
-          echo "=== Sen-CaPoo/litellm-zhtw 可用 Release Tags ==="
-          curl -sL \
-            -H "Accept: application/vnd.github+json" \
-            https://api.github.com/repos/Sen-CaPoo/litellm-zhtw/releases?per_page=10 | \
-            jq -r '.[] | "  \(.tag_name)  —  \(.published_at | split("T")[0])"' || \
-            echo "获取失败，请直接访问: https://github.com/Sen-CaPoo/litellm-zhtw/releases"
-          echo ""
-          echo "提示: 在 'Run workflow' 时输入上方任意 tag，或输入 latest 自动使用最新版"
-
-  build-and-push:
-    runs-on: ubuntu-latest
-    needs: list-releases
     permissions:
       contents: read
       packages: write
 
     steps:
-      - name: Checkout my repository
+      - name: 检出 LiteLLM 官方源码
         uses: actions/checkout@v4
+        with:
+          repository: BerriAI/litellm
+          ref: ${{ github.event.inputs.litellm_version || 'v1.99.1' }}
+          path: litellm-src
 
-      - name: Resolve upstream release tag
+      - name: 解析上游 i18n Release Tag
         id: upstream
         run: |
           set -e
           TAG="${{ github.event.inputs.upstream_tag || 'latest' }}"
-          
           if [ "$TAG" = "latest" ]; then
-            echo "正在获取最新 release tag..."
             TAG=$(curl -sL --fail \
               -H "Accept: application/vnd.github+json" \
               https://api.github.com/repos/Sen-CaPoo/litellm-zhtw/releases/latest | \
               jq -r '.tag_name // empty')
-            
-            if [ -z "$TAG" ]; then
-              echo "::error::无法获取最新 release，请手动指定 tag"
-              exit 1
-            fi
+            [ -z "$TAG" ] && { echo "::error::获取最新 release 失败"; exit 1; }
           fi
-          
           echo "tag=$TAG" >> $GITHUB_OUTPUT
-          echo "使用上游 release tag: $TAG"
 
-      - name: Fetch upstream i18n source
-        id: fetch
+      - name: 拉取上游国际化源码
         run: |
           set -e
           UPSTREAM_DIR=$(mktemp -d)
-          TAG="${{ steps.upstream.outputs.tag }}"
-          
-          echo "正在克隆 tag: $TAG ..."
-          
-          # git clone --branch 同时支持分支和 tag
-          # 但对于 tag，某些 git 版本需要显式指定 --single-branch
-          git clone --depth 1 --branch "$TAG" --single-branch \
+          git clone --depth 1 --branch "${{ steps.upstream.outputs.tag }}" --single-branch \
             https://github.com/Sen-CaPoo/litellm-zhtw.git "$UPSTREAM_DIR"
-          
-          COMMIT_SHORT=$(cd "$UPSTREAM_DIR" && git rev-parse --short HEAD)
-          echo "commit=$COMMIT_SHORT" >> $GITHUB_OUTPUT
-          echo "✅ 成功拉取: tag=$TAG, commit=$COMMIT_SHORT"
-          
-          cp -r "$UPSTREAM_DIR/zhtw" ./zhtw
+          cp -r "$UPSTREAM_DIR/zhtw" ./litellm-src/zhtw
           rm -rf "$UPSTREAM_DIR"
 
-      - name: Set up Docker Buildx
+      - name: 注入 i18n 补丁到 Dockerfile
+        run: |
+          cd litellm-src
+          # 在 build_admin_ui.sh 之后插入 i18n 步骤
+          sed -i '/.\/docker\/build_admin_ui.sh/a \
+          \
+          # ====== i18n 补丁 ======\
+          ARG LITELLM_UI_LANG=zh-CN\
+          COPY zhtw/ /zhtw/\
+          RUN LITELLM_UI_LANG="$LITELLM_UI_LANG" python /zhtw/patch_ui.py \&\& rm -rf /zhtw\
+          # ======================' docker/Dockerfile
+
+      - name: 安装 Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Login to GHCR
+      - name: 登录到 GHCR
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata
+      - name: 生成镜像标签
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=raw,value=${{ github.event.inputs.ui_lang || 'zh-CN' }}-${{ github.event.inputs.litellm_version || 'v1.99.1' }}
-            type=raw,value=${{ github.event.inputs.ui_lang || 'zh-CN' }}-latest
-            type=raw,value=${{ github.event.inputs.ui_lang || 'zh-CN' }}-${{ github.event.inputs.litellm_version || 'v1.99.1' }}-upstream-${{ steps.fetch.outputs.commit }}
+            type=raw,value=${{ github.event.inputs.litellm_version || 'v1.99.1' }}-${{ github.event.inputs.ui_lang || 'zh-CN' }}
+            type=raw,value=latest-${{ github.event.inputs.ui_lang || 'zh-CN' }}
 
-      - name: Build and push
+      - name: 构建并推送镜像
         uses: docker/build-push-action@v5
         with:
-          context: .
+          context: ./litellm-src
+          file: ./litellm-src/docker/Dockerfile
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             LITELLM_UI_LANG=${{ github.event.inputs.ui_lang || 'zh-CN' }}
-            LITELLM_VERSION=${{ github.event.inputs.litellm_version || 'v1.99.1' }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           platforms: linux/amd64,linux/arm64
